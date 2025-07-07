@@ -1,0 +1,220 @@
+name: Veracode Ultra Workflow (Full Builds + SARIF)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+
+  # -----------------------------
+  # 🔍 Veracode SCA
+  # -----------------------------
+  sca:
+    name: 🔍 Veracode SCA (SourceClear)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🏁 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🔬 Run Veracode SCA
+        env:
+          SRCCLR_API_TOKEN: ${{ secrets.SRCCLR_API_TOKEN }}
+        run: |
+          echo "🔍 Running Veracode SCA..."
+          curl -sSL 'https://download.sourceclear.com/ci.sh' | bash -s -- scan
+
+  # -----------------------------
+  # 🧩 Detect Stack
+  # -----------------------------
+  detect_stack:
+    name: 🧩 Detect Project Stack
+    runs-on: ubuntu-latest
+    outputs:
+      language: ${{ steps.detect.outputs.language }}
+    steps:
+      - name: 🏁 Checkout Repository
+        uses: actions/checkout@v4
+
+      - id: detect
+        name: 🔍 Detect Language
+        run: |
+          echo "Detecting..."
+          lang="unsupported"
+
+          if find . -name "pom.xml" | grep -q .; then lang="maven"
+          elif find . -name "build.gradle" | grep -q .; then lang="gradle"
+          elif find . -name "pubspec.yaml" | grep -q .; then lang="flutter"
+          elif find . -name "*.groovy" | grep -q .; then lang="groovy"
+          else lang="unknown"; fi
+
+          echo "Detected: $lang"
+          echo "language=$lang" >> $GITHUB_OUTPUT
+
+  # -----------------------------
+  # ⚙️ Build Auto-Packager (Java, Gradle)
+  # -----------------------------
+  build_auto:
+    name: ⚙️ Build Auto-Packager
+    runs-on: ubuntu-latest
+    needs: detect_stack
+    if: needs.detect_stack.outputs.language == 'maven' || needs.detect_stack.outputs.language == 'gradle'
+    outputs:
+      artifact: ${{ steps.find.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 📦 Run Veracode Auto-Packager
+        run: |
+          echo "Running Veracode Auto-Packager..."
+          curl -sSfL https://tools.veracode.com/veracode-cli/install | sh
+          ./veracode package --source . --output veracode-out --trust
+          cp veracode-out/*.zip analisysPack.zip
+
+      - id: find
+        run: echo "artifact=analisysPack.zip" >> $GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veracode-package
+          path: analisysPack.zip
+
+  # -----------------------------
+  # 🐧 Build Manual Linux (Flutter, Groovy)
+  # -----------------------------
+  build_manual_linux:
+    name: 🐧 Build Manual Linux
+    runs-on: ubuntu-latest
+    needs: detect_stack
+    if: |
+      needs.detect_stack.outputs.language == 'flutter' ||
+      needs.detect_stack.outputs.language == 'groovy'
+    outputs:
+      artifact: ${{ steps.pack.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ⚙️ Install Flutter & Dart
+        if: needs.detect_stack.outputs.language == 'flutter'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libgl1-mesa-dev
+
+      - name: ⚙️ Install Groovy
+        if: needs.detect_stack.outputs.language == 'groovy'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y groovy
+
+      - name: ⚙️ Setup Flutter
+        if: needs.detect_stack.outputs.language == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.x'
+
+      - name: ⚙️ Run Robust Build
+        id: pack
+        run: |
+          mkdir -p output
+          lang="${{ needs.detect_stack.outputs.language }}"
+
+          if [ "$lang" = "groovy" ]; then
+            echo "🔍 Detectado Groovy puro"
+            mkdir -p output/groovy
+            echo "Compilando *.groovy..."
+            groovyc *.groovy -d output/groovy || cp *.groovy output/groovy/
+          fi
+
+          if [ "$lang" = "flutter" ]; then
+            echo "🔍 Procurando TODOS os pubspec.yaml..."
+            found_any=0
+            mkdir -p output/flutter
+
+            find . -type f -name "pubspec.yaml" | while read pubspec; do
+              module_dir=$(dirname "$pubspec")
+              echo "📌 Módulo: $module_dir"
+              cd "$module_dir"
+
+              echo "📦 flutter pub get"
+              flutter pub get || true
+
+              if grep -q "build_runner" pubspec.yaml; then
+                echo "🔧 build_runner detectado"
+                flutter pub run build_runner build --delete-conflicting-outputs || true
+              fi
+
+              FLAVOR_ARG=""
+              if grep -qi "flavor" pubspec.yaml || ls | grep -q "flavors"; then
+                echo "⚙️ Possível flavor detectado"
+                if grep -qi "prod" pubspec.yaml; then FLAVOR_ARG="--flavor prod"; fi
+                if grep -qi "production" pubspec.yaml; then FLAVOR_ARG="--flavor production"; fi
+                if grep -qi "stage" pubspec.yaml; then FLAVOR_ARG="--flavor staging"; fi
+              fi
+
+              echo "🏗️ flutter build apk $FLAVOR_ARG"
+              flutter build apk $FLAVOR_ARG --debug || flutter build apk --debug || true
+
+              echo "📂 Coletando APKs..."
+              mkdir -p ../../output/flutter/$module_dir
+              cp -r build/app/outputs/flutter-apk/*.apk ../../output/flutter/$module_dir/ || echo "⚠️ Nenhum APK encontrado!"
+
+              cd - > /dev/null
+            done
+          fi
+
+          echo "📦 Compactando final..."
+          zip -r analisysPack.zip output
+          echo "artifact=analisysPack.zip" >> $GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veracode-package
+          path: analisysPack.zip
+
+  # -----------------------------
+  # 🔍 Pipeline Scan + SAST
+  # -----------------------------
+  pipeline_scan:
+    name: 🔍 Veracode Pipeline Scan
+    runs-on: ubuntu-latest
+    needs: [build_auto, build_manual_linux]
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: veracode-package
+          path: ${{ github.workspace }}
+
+      - name: 🧩 Run Veracode Pipeline Scan
+        uses: veracode/Veracode-pipeline-scan-action@v1.0.18
+        with:
+          vid: ${{ secrets.APIID }}
+          vkey: ${{ secrets.APIKEY }}
+          file: "analisysPack.zip"
+          fail_build: false
+
+  sast:
+    name: 🔒 Veracode Upload & SAST
+    runs-on: ubuntu-latest
+    needs: [build_auto, build_manual_linux]
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: veracode-package
+          path: ${{ github.workspace }}
+
+      - name: 🔒 Upload & Run Veracode SAST
+        uses: veracode/veracode-uploadandscan-action@0.2.8
+        with:
+          vid: ${{ secrets.APIID }}
+          vkey: ${{ secrets.APIKEY }}
+          appname: "GitHub - ${{ github.repository }}"
+          createprofile: true
+          filepath: "analisysPack.zip"
+          version: ${{ github.run_id }}
